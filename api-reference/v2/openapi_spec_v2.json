@@ -12776,10 +12776,9 @@
         "type": "object",
         "properties": {
           "amount": {
-            "type": "number",
-            "format": "double",
+            "type": "string",
             "description": "The discount value (e.g., \"5.50\").",
-            "example": 38.02,
+            "example": "5.50",
             "nullable": true
           },
           "end_date": {
