@@ -36,7 +36,6 @@ use super::{Operation, OperationSessionSetters, PostUpdateTracker};
 use crate::core::payment_methods::transformers::call_modular_payment_method_update;
 #[cfg(all(feature = "v1", feature = "dynamic_routing"))]
 use crate::core::routing::helpers as routing_helpers;
-use crate::utils::OptionExt;
 use crate::{
     connector::utils::PaymentResponseRouterData,
     consts,
@@ -64,6 +63,7 @@ use crate::{
         CaptureSyncResponse, ErrorResponse,
     },
     utils,
+    utils::OptionExt,
 };
 
 /// This implementation executes the flow only when
@@ -2677,33 +2677,36 @@ async fn payment_response_update_tracker<F: Clone, T: types::Capturable>(
         let m_storage_scheme = processor.get_account().storage_scheme;
 
         let label = {
-                let connector_label = core_utils::get_connector_label(
-                    payment_data.get_payment_intent().business_country,
-                    payment_data.get_payment_intent().business_label.as_ref(),
-                    payment_data
-                        .get_payment_attempt()
-                        .business_sub_label
-                        .as_ref(),
-                    &connector_name,
-                );
+            let connector_label = core_utils::get_connector_label(
+                payment_data.get_payment_intent().business_country,
+                payment_data.get_payment_intent().business_label.as_ref(),
+                payment_data
+                    .get_payment_attempt()
+                    .business_sub_label
+                    .as_ref(),
+                &connector_name,
+            );
 
-                if let Some(connector_label) = payment_data.payment_attempt.merchant_connector_id.clone()
-                    .map(|mca_id| mca_id.get_string_repr().to_string())
-                    .or(connector_label)
-                {
-                    connector_label
-                } else {
-                    let profile_id = payment_data
-                        .get_payment_intent()
-                        .profile_id
-                        .as_ref()
-                        .get_required_value("profile_id")
-                        .change_context(errors::ApiErrorResponse::InternalServerError)
-                        .attach_printable("profile_id is not set in payment_intent")?;
+            if let Some(connector_label) = payment_data
+                .payment_attempt
+                .merchant_connector_id
+                .clone()
+                .map(|mca_id| mca_id.get_string_repr().to_string())
+                .or(connector_label)
+            {
+                connector_label
+            } else {
+                let profile_id = payment_data
+                    .get_payment_intent()
+                    .profile_id
+                    .as_ref()
+                    .get_required_value("profile_id")
+                    .change_context(errors::ApiErrorResponse::InternalServerError)
+                    .attach_printable("profile_id is not set in payment_intent")?;
 
-                    format!("{connector_name}_{}", profile_id.get_string_repr())
-                }
-            };
+                format!("{connector_name}_{}", profile_id.get_string_repr())
+            }
+        };
 
         tokio::spawn(
             async move {
