@@ -249,6 +249,10 @@ where
                         .map(|raw_connector_response| raw_connector_response.expose().into());
                     router_data.connector_http_status_code = Some(ucs_data.status_code);
 
+                    ucs_data.connector_customer_id.map(|connector_customer_id| {
+                        router_data.connector_customer = Some(connector_customer_id);
+                    });
+
                     ucs_data.connector_response.map(|connector_response| {
                         router_data.connector_response = Some(connector_response);
                     });

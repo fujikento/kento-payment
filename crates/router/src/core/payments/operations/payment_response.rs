@@ -2656,6 +2656,76 @@ async fn payment_response_update_tracker<F: Clone, T: types::Capturable>(
         &payment_data,
     );
 
+    // Update connector_customer in customer if present in router_data
+if let (Some(connector_customer_id), Some(customer_id), Some(connector_label)) = (
+    router_data.connector_customer.clone(),
+    payment_data.payment_intent.customer_id.clone(),
+    payment_data.payment_attempt.connector.clone(),
+) {
+    let m_db = state.clone().store;
+    let m_merchant_id = router_data.merchant_id.clone();
+    let m_key_store = processor.get_key_store().clone();
+    let m_storage_scheme = processor.get_account().storage_scheme;
+
+    // Spawn a task to update connector_customer (non-blocking)
+    let _ = tokio::spawn(
+        async move {
+            // Fetch the existing customer
+            match m_db
+                .find_customer_by_customer_id_merchant_id(
+                    &customer_id,
+                    &m_merchant_id,
+                    &m_key_store,
+                    m_storage_scheme,
+                )
+                .await
+            {
+                Ok(customer) => {
+                    // Use the helper function to create the update
+                    if let Some(customer_update) = hyperswitch_domain_models::customer::update_connector_customer_in_customers(
+                        &connector_label,
+                        customer.connector_customer.as_ref(),
+                        Some(connector_customer_id),
+                    )
+                    .await
+                    {
+                        match m_db
+                            .update_customer_by_customer_id_merchant_id(
+                                customer_id,
+                                m_merchant_id,
+                                customer,
+                                customer_update,
+                                &m_key_store,
+                                m_storage_scheme,
+                            )
+                            .await
+                        {
+                            Ok(_) => {
+                                logger::info!(
+                                    "Successfully updated connector_customer for customer_id"
+                                );
+                            }
+                            Err(e) => {
+                                logger::error!(
+                                    "Failed to update connector_customer in customer: {:?}",
+                                    e
+                                );
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    logger::error!(
+                        "Failed to fetch customer for connector_customer update: {:?}",
+                        e
+                    );
+                }
+            }
+        }
+        .in_current_span(),
+    );
+}
+
     let payment_intent_update = match &router_data.response {
         Err(_) => storage::PaymentIntentUpdate::PGStatusUpdate {
             status: api_models::enums::IntentStatus::foreign_from(
