@@ -36,7 +36,6 @@ use super::{Operation, OperationSessionSetters, PostUpdateTracker};
 use crate::core::payment_methods::transformers::call_modular_payment_method_update;
 #[cfg(all(feature = "v1", feature = "dynamic_routing"))]
 use crate::core::routing::helpers as routing_helpers;
-#[cfg(feature = "v2")]
 use crate::utils::OptionExt;
 use crate::{
     connector::utils::PaymentResponseRouterData,
@@ -2072,6 +2071,8 @@ async fn payment_response_update_tracker<F: Clone, T: types::Capturable>(
                                         429 => router_data.status,
                                         _ => enums::AttemptStatus::Failure,
                                     }
+                                } else if sub_flow == "CancelPostCapture" {
+                                    router_data.status
                                 } else {
                                     match err.status_code {
                                         500..=511 => enums::AttemptStatus::Pending,
@@ -2526,7 +2527,15 @@ async fn payment_response_update_tracker<F: Clone, T: types::Capturable>(
                             }
                             None => (None, None, None),
                         },
-                        types::PaymentsResponseData::PaymentsCreateOrderResponse { .. } => {
+                        types::PaymentsResponseData::PaymentsCreateOrderResponse { .. } => (
+                            None,
+                            Some(storage::PaymentAttemptUpdate::StatusUpdate {
+                                status: updated_attempt_status,
+                                updated_by: processor.get_account().storage_scheme.to_string(),
+                            }),
+                            None,
+                        ),
+                        types::PaymentsResponseData::PostCaptureVoidResponse { .. } => {
                             (None, None, None)
                         }
                     }
@@ -2657,49 +2666,75 @@ async fn payment_response_update_tracker<F: Clone, T: types::Capturable>(
     );
 
     // Update connector_customer in customer if present in router_data
-if let (Some(connector_customer_id), Some(customer_id), Some(connector_label)) = (
-    router_data.connector_customer.clone(),
-    payment_data.payment_intent.customer_id.clone(),
-    payment_data.payment_attempt.connector.clone(),
-) {
-    let m_db = state.clone().store;
-    let m_merchant_id = router_data.merchant_id.clone();
-    let m_key_store = processor.get_key_store().clone();
-    let m_storage_scheme = processor.get_account().storage_scheme;
+    if let (Some(connector_customer_id), Some(customer_id), Some(connector_name)) = (
+        router_data.connector_customer.clone(),
+        payment_data.payment_intent.customer_id.clone(),
+        payment_data.payment_attempt.connector.clone(),
+    ) {
+        let m_db = state.clone().store;
+        let m_merchant_id = router_data.merchant_id.clone();
+        let m_key_store = processor.get_key_store().clone();
+        let m_storage_scheme = processor.get_account().storage_scheme;
 
-    // Spawn a task to update connector_customer (non-blocking)
-    let _ = tokio::spawn(
-        async move {
-            // Fetch the existing customer
-            match m_db
-                .find_customer_by_customer_id_merchant_id(
-                    &customer_id,
-                    &m_merchant_id,
-                    &m_key_store,
-                    m_storage_scheme,
-                )
-                .await
-            {
-                Ok(customer) => {
-                    // Use the helper function to create the update
-                    if let Some(customer_update) = hyperswitch_domain_models::customer::update_connector_customer_in_customers(
-                        &connector_label,
-                        customer.connector_customer.as_ref(),
-                        Some(connector_customer_id),
+        let label = {
+                let connector_label = core_utils::get_connector_label(
+                    payment_data.get_payment_intent().business_country,
+                    payment_data.get_payment_intent().business_label.as_ref(),
+                    payment_data
+                        .get_payment_attempt()
+                        .business_sub_label
+                        .as_ref(),
+                    &connector_name,
+                );
+
+                if let Some(connector_label) = payment_data.payment_attempt.merchant_connector_id.clone()
+                    .map(|mca_id| mca_id.get_string_repr().to_string())
+                    .or(connector_label)
+                {
+                    connector_label
+                } else {
+                    let profile_id = payment_data
+                        .get_payment_intent()
+                        .profile_id
+                        .as_ref()
+                        .get_required_value("profile_id")
+                        .change_context(errors::ApiErrorResponse::InternalServerError)
+                        .attach_printable("profile_id is not set in payment_intent")?;
+
+                    format!("{connector_name}_{}", profile_id.get_string_repr())
+                }
+            };
+
+        tokio::spawn(
+            async move {
+                match m_db
+                    .find_customer_by_customer_id_merchant_id(
+                        &customer_id,
+                        &m_merchant_id,
+                        &m_key_store,
+                        m_storage_scheme,
                     )
                     .await
-                    {
-                        match m_db
-                            .update_customer_by_customer_id_merchant_id(
-                                customer_id,
-                                m_merchant_id,
-                                customer,
-                                customer_update,
-                                &m_key_store,
-                                m_storage_scheme,
-                            )
-                            .await
+                {
+                    Ok(customer) => {
+                        if let Some(customer_update) = hyperswitch_domain_models::customer::update_connector_customer_in_customers(
+                            &label,
+                            customer.connector_customer.as_ref(),
+                            Some(connector_customer_id),
+                        )
+                        .await
                         {
+                            match m_db
+                                .update_customer_by_customer_id_merchant_id(
+                                    customer_id,
+                                    m_merchant_id,
+                                    customer,
+                                    customer_update,
+                                    &m_key_store,
+                                    m_storage_scheme,
+                                )
+                                .await
+                                {
                             Ok(_) => {
                                 logger::info!(
                                     "Successfully updated connector_customer for customer_id"
@@ -2712,51 +2747,26 @@ if let (Some(connector_customer_id), Some(customer_id), Some(connector_label)) =
                                 );
                             }
                         }
+                        }
+                    }
+                    Err(e) => {
+                        logger::error!(
+                            "Failed to fetch customer for connector_customer update: {:?}",
+                            e
+                        );
                     }
                 }
-                Err(e) => {
-                    logger::error!(
-                        "Failed to fetch customer for connector_customer update: {:?}",
-                        e
-                    );
-                }
             }
-        }
-        .in_current_span(),
-    );
-}
+            .in_current_span(),
+        );
+    }
 
-    let payment_intent_update = match &router_data.response {
-        Err(_) => storage::PaymentIntentUpdate::PGStatusUpdate {
-            status: api_models::enums::IntentStatus::foreign_from(
-                payment_data.payment_attempt.status,
-            ),
-            updated_by: processor.get_account().storage_scheme.to_string(),
-            // make this false only if initial payment fails, if incremental authorization call fails don't make it false
-            incremental_authorization_allowed: Some(false),
-            feature_metadata: payment_data
-                .payment_intent
-                .feature_metadata
-                .clone()
-                .map(masking::Secret::new),
-        },
-        Ok(_) => storage::PaymentIntentUpdate::ResponseUpdate {
-            status: api_models::enums::IntentStatus::foreign_from(
-                payment_data.payment_attempt.status,
-            ),
-            amount_captured,
-            updated_by: processor.get_account().storage_scheme.to_string(),
-            fingerprint_id: payment_data.payment_attempt.fingerprint_id.clone(),
-            incremental_authorization_allowed: payment_data
-                .payment_intent
-                .incremental_authorization_allowed,
-            feature_metadata: payment_data
-                .payment_intent
-                .feature_metadata
-                .clone()
-                .map(masking::Secret::new),
-        },
-    };
+    let payment_intent_update = get_payment_intent_update_data::<_, _>(
+        payment_data.clone(),
+        &router_data,
+        processor,
+        amount_captured,
+    );
 
     let m_db = state.clone().store;
     let m_key_store = processor.get_key_store().clone();
@@ -2911,6 +2921,68 @@ if let (Some(connector_customer_id), Some(customer_id), Some(connector_label)) =
                 },
             ))
         }
+    }
+}
+
+#[cfg(feature = "v1")]
+fn get_payment_intent_update_data<F: Clone, T: types::Capturable>(
+    payment_data: PaymentData<F>,
+    router_data: &types::RouterData<F, T, types::PaymentsResponseData>,
+    processor: &domain::Processor,
+    amount_captured: Option<MinorUnit>,
+) -> storage::PaymentIntentUpdate {
+    match &router_data.response {
+        Err(_) => storage::PaymentIntentUpdate::PGStatusUpdate {
+            status: api_models::enums::IntentStatus::foreign_from(
+                payment_data.payment_attempt.status,
+            ),
+            updated_by: processor.get_account().storage_scheme.to_string(),
+            incremental_authorization_allowed: Some(false),
+            feature_metadata: payment_data
+                .payment_intent
+                .feature_metadata
+                .clone()
+                .map(masking::Secret::new),
+        },
+        Ok(types::PaymentsResponseData::PostCaptureVoidResponse {
+            post_capture_void_status,
+            connector_reference_id,
+            description,
+        }) => {
+            let post_capture_void_response = common_types::domain::PostCaptureVoidData {
+                status: *post_capture_void_status,
+                connector_reference_id: connector_reference_id.clone(),
+                description: description.clone(),
+            };
+
+            let current_state = payment_data
+                .payment_intent
+                .state_metadata
+                .clone()
+                .unwrap_or_default()
+                .set_post_capture_void_data(post_capture_void_response);
+
+            storage::PaymentIntentUpdate::StateMetadataUpdate {
+                state_metadata: current_state.clone(),
+                updated_by: processor.get_account().storage_scheme.to_string(),
+            }
+        }
+        Ok(_) => storage::PaymentIntentUpdate::ResponseUpdate {
+            status: api_models::enums::IntentStatus::foreign_from(
+                payment_data.payment_attempt.status,
+            ),
+            amount_captured,
+            updated_by: processor.get_account().storage_scheme.to_string(),
+            fingerprint_id: payment_data.payment_attempt.fingerprint_id.clone(),
+            incremental_authorization_allowed: payment_data
+                .payment_intent
+                .incremental_authorization_allowed,
+            feature_metadata: payment_data
+                .payment_intent
+                .feature_metadata
+                .clone()
+                .map(masking::Secret::new),
+        },
     }
 }
 
